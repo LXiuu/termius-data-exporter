@@ -1,0 +1,7 @@
+{
+  "dependencies": {
+    "keytar": "^7.9.0",
+    "libsodium-wrappers": "^0.8.4",
+    "snappyjs": "^0.7.0"
+  }
+}
