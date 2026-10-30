@@ -17,7 +17,25 @@ const crypto = require('crypto');
 const snappy = require('snappyjs');
 
 const BOM = '\ufeff';
-const DB_PATH = path.join(process.env.APPDATA, 'Termius/IndexedDB/file__0.indexeddb.leveldb/');
+function getDatabasePath(platform = process.platform, env = process.env, home = os.homedir()) {
+  let appData;
+  switch (platform) {
+    case 'win32':
+      appData = env.APPDATA || path.join(home, 'AppData', 'Roaming');
+      break;
+    case 'darwin':
+      appData = path.join(home, 'Library', 'Application Support');
+      break;
+    case 'linux':
+      appData = env.XDG_CONFIG_HOME || path.join(home, '.config');
+      break;
+    default:
+      throw new Error(`不支持的操作系统: ${platform}`);
+  }
+  return path.join(appData, 'Termius', 'IndexedDB', 'file__0.indexeddb.leveldb');
+}
+
+const DB_PATH = getDatabasePath();
 const OUTPUT_DIR = __dirname;
 const OUTPUT_FILES = Object.freeze({
   hostsCsv: 'termius_import.csv',
@@ -2656,9 +2674,13 @@ async function main() {
   // 初始化
   await sodium.ready;
 
+  if (!fs.existsSync(DB_PATH)) {
+    throw new Error(`未找到 Termius 数据库: ${DB_PATH}，请确保已安装并登录 Termius`);
+  }
+
   // 获取密钥
   logStep(1, 4, '准备解密密钥');
-  logNote('正在读取 Windows 凭据管理器中的 Termius localKey...');
+  logNote('正在读取系统凭据存储中的 Termius localKey...');
   const key = await getEncryptionKey();
   logNote('密钥读取成功。\n');
 
@@ -2696,6 +2718,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  getDatabasePath,
   parseDecryptedData,
   buildHostConfig,
   exportHostsCsv,
