@@ -15,6 +15,7 @@ const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 const snappy = require('snappyjs');
+const v8 = require('v8');
 
 const BOM = '\ufeff';
 function getDatabasePath(platform = process.platform, env = process.env, home = os.homedir()) {
@@ -1746,14 +1747,72 @@ function extractCurrentLevelDbValues(sourceDir) {
   }
 }
 
+function deserializeIndexedDbValue(buffer) {
+  // Chromium prefixes V8 data with an IndexedDB version and a Blink envelope.
+  // Probe only the header; encrypted strings elsewhere are not record boundaries.
+  for (let offset = 0; offset < Math.min(buffer.length - 1, 16); offset++) {
+    if (buffer[offset] !== 0xff) continue;
+    try {
+      return v8.deserialize(buffer.subarray(offset));
+    } catch {}
+  }
+  return null;
+}
+
+function normalizeCurrentRecord(record) {
+  let content = {};
+  const payload = record.content || record.command;
+  if (typeof payload === 'string') {
+    try {
+      const parsed = JSON.parse(payload);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) content = parsed;
+    } catch {}
+  }
+  const current = { ...content, ...record, __termius_current_record: true };
+  delete current.content;
+  delete current.command;
+  return current;
+}
+
 async function extractAndDecrypt(key) {
   let encryptedCount = 0;
   let decryptedCount = 0;
   const decryptCache = new Map();
   const results = [];
+  const structuredResults = [];
+  const records = extractCurrentLevelDbValues(DB_PATH);
 
-  extractCurrentLevelDbValues(DB_PATH).forEach(record => {
+  for (const record of records) {
     const buffer = record.value;
+    const structured = deserializeIndexedDbValue(buffer);
+    if (structured && typeof structured === 'object' && !Array.isArray(structured)) {
+      const decode = async (value, field = '') => {
+        if (typeof value === 'string' && /^BA[A-Za-z0-9+/=]{30,}$/.test(value)) {
+          encryptedCount++;
+          if (!decryptCache.has(value)) decryptCache.set(value, await decrypt(value, key));
+          const plaintext = decryptCache.get(value);
+          if (plaintext === null) throw new Error(`数据库字段解密失败 (${field})，已停止导出以避免写入不完整数据`);
+          decryptedCount++;
+          return plaintext;
+        }
+        if (Array.isArray(value)) return Promise.all(value.map(item => decode(item, field)));
+        if (value && typeof value === 'object') {
+          const decoded = {};
+          for (const [name, item] of Object.entries(value)) decoded[name] = await decode(item, name);
+          return decoded;
+        }
+        return value;
+      };
+      const decoded = await decode(structured);
+      structuredResults.push({
+        text: JSON.stringify(normalizeCurrentRecord(decoded)),
+        file: record.file,
+        sequence: record.sequence,
+        current: true,
+        meta: {}
+      });
+      continue;
+    }
     const text = buffer.toString('latin1');
     let match;
 
@@ -1778,7 +1837,7 @@ async function extractAndDecrypt(key) {
         meta: buildEncryptedBlockMeta(buffer, match.index, match.index + encrypted.length)
       });
     }
-  });
+  }
 
   for (const result of results) {
     let decrypted = decryptCache.get(result.text);
@@ -1792,7 +1851,7 @@ async function extractAndDecrypt(key) {
     if (decrypted) decryptedCount++;
   }
 
-  const decryptedResults = results.filter(result => result.text);
+  const decryptedResults = [...structuredResults, ...results.filter(result => result.text)];
   Object.defineProperty(decryptedResults, 'stats', {
     enumerable: false,
     value: {
@@ -1849,7 +1908,18 @@ function parseDecryptedData(results) {
 
       objects.forEach(obj => {
         if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return;
+        if (/DELETE|REMOVED/i.test(valueToString(obj.status)) || obj.deleted === true) return;
         applyMetadataIds(obj, meta);
+
+        // Current Termius stores SSH-config/identity links as separate records.
+        if (obj.__termius_current_record && obj.ssh_config && obj.identity && !obj.address) {
+          sshConfigs.push({
+            ...obj.ssh_config,
+            identity: obj.identity,
+            __termius_current_record: true
+          });
+          return;
+        }
 
         // 身份认证 (带密码)
         if (isIdentityRecord(obj)) {
@@ -1934,6 +2004,12 @@ function buildSshConfigIndex(data) {
 }
 
 function referencedSshConfigIds(hostDefinition) {
+  if (hostDefinition.__termius_current_record) {
+    return {
+      ids: toStringList([hostDefinition.ssh_config?.id]),
+      localIds: toStringList([hostDefinition.ssh_config?.local_id])
+    };
+  }
   const ownIds = new Set(recordPrimaryIds(hostDefinition));
   const ownLocalIds = new Set(recordPrimaryLocalIds(hostDefinition));
   const refs = Array.isArray(hostDefinition.__termius_ssh_config_object_refs)
@@ -2000,6 +2076,22 @@ function exactIdentityIdsFromSshConfig(data, config) {
 
 function identitiesForHostDefinition(data, hostDefinition) {
   const configs = sshConfigsForHostDefinition(data, hostDefinition);
+  if (hostDefinition.__termius_current_record) {
+    const identities = uniqueObjects(configs.flatMap(config => {
+      const ref = config.identity;
+      if (!ref || typeof ref !== 'object') return [];
+      const current = data.identities.filter(identity => identity.__termius_current_record);
+      const byId = ref.id === undefined ? [] : current.filter(identity => valueToString(identity.id) === valueToString(ref.id));
+      if (byId.length) return byId;
+      return ref.local_id === undefined ? [] : current.filter(identity => valueToString(identity.local_id) === valueToString(ref.local_id));
+    }));
+    return {
+      configs,
+      configIds: [...new Set(configs.flatMap(recordPrimaryIds))],
+      identityIds: [...new Set(identities.flatMap(collectRecordIds))],
+      identities
+    };
+  }
   const identityIds = [
     ...new Set(configs.flatMap(config => exactIdentityIdsFromSshConfig(data, config)))
   ];
@@ -2718,6 +2810,8 @@ if (require.main === module) {
 }
 
 module.exports = {
+  deserializeIndexedDbValue,
+  normalizeCurrentRecord,
   getDatabasePath,
   parseDecryptedData,
   buildHostConfig,
