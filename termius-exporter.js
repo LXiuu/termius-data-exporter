@@ -1505,6 +1505,7 @@ function levelDbRecordLatestValue(records, userKey, sequence, valueType, value, 
   if (existing && existing.sequence > sequence) return;
 
   records.set(key, {
+    userKey,
     sequence,
     valueType,
     value: valueType === 1 ? value : null,
@@ -1738,6 +1739,7 @@ function extractCurrentLevelDbValues(sourceDir) {
     return [...records.values()]
       .filter(record => record.valueType === 1 && record.value && record.value.length)
       .map(record => ({
+        userKey: record.userKey,
         value: record.value,
         file: record.file,
         sequence: record.sequence
@@ -1757,6 +1759,22 @@ function deserializeIndexedDbValue(buffer) {
     } catch {}
   }
   return null;
+}
+
+function decodeIndexedDbKey(key) {
+  if (!key || key.length < 4) return null;
+  const lengths = [(key[0] >> 5) + 1, ((key[0] >> 2) & 7) + 1, (key[0] & 3) + 1];
+  let offset = 1;
+  const ids = [];
+  for (const length of lengths) {
+    if (offset + length > key.length) return null;
+    let value = 0n;
+    for (let index = 0; index < length; index++) value |= BigInt(key[offset + index]) << BigInt(index * 8);
+    ids.push(value.toString());
+    offset += length;
+  }
+  const primaryKey = key[offset] === 3 && key.length === offset + 9 ? key.readDoubleLE(offset + 1) : undefined;
+  return { databaseId: ids[0], storeId: ids[1], indexId: ids[2], offset, primaryKey };
 }
 
 function normalizeCurrentRecord(record) {
@@ -1781,6 +1799,18 @@ async function extractAndDecrypt(key) {
   const results = [];
   const structuredResults = [];
   const records = extractCurrentLevelDbValues(DB_PATH);
+  const stores = new Map();
+  for (const record of records) {
+    const prefix = decodeIndexedDbKey(record.userKey);
+    if (!prefix || prefix.storeId !== '0' || prefix.indexId !== '0') continue;
+    const metadata = record.userKey.subarray(prefix.offset);
+    if (metadata[0] !== 50) continue;
+    const store = levelDbReadVarint(metadata, 1);
+    if (!store || store.next !== metadata.length - 1 || metadata[store.next] !== 0) continue;
+    if (record.value.length % 2) continue;
+    const name = Buffer.from(record.value).swap16().toString('utf16le');
+    stores.set(`${prefix.databaseId}:${store.value}`, name);
+  }
 
   for (const record of records) {
     const buffer = record.value;
@@ -1804,6 +1834,11 @@ async function extractAndDecrypt(key) {
         return value;
       };
       const decoded = await decode(structured);
+      const prefix = decodeIndexedDbKey(record.userKey);
+      if (prefix) {
+        decoded.__termius_collection = stores.get(`${prefix.databaseId}:${prefix.storeId}`) || '';
+        if (decoded.local_id === undefined && Number.isSafeInteger(prefix.primaryKey)) decoded.local_id = prefix.primaryKey;
+      }
       structuredResults.push({
         text: JSON.stringify(normalizeCurrentRecord(decoded)),
         file: record.file,
@@ -1878,6 +1913,8 @@ function parseDecryptedData(results) {
   const snippets = new Map();
   const knownHostKeys = new Map();
   const fieldParts = [];
+  const tags = [];
+  const tagHosts = [];
 
   results.forEach((result, index) => {
     const raw = resultText(result).trim();
@@ -1910,6 +1947,19 @@ function parseDecryptedData(results) {
         if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return;
         if (/DELETE|REMOVED/i.test(valueToString(obj.status)) || obj.deleted === true) return;
         applyMetadataIds(obj, meta);
+
+        if (obj.__termius_collection === 'tags') {
+          tags.push(obj);
+          return;
+        }
+        if (obj.__termius_collection === 'tag_hosts') {
+          tagHosts.push(obj);
+          return;
+        }
+        if (obj.__termius_collection === 'groups') {
+          collectRecordIds(obj).forEach(id => groupsById.set(id, obj));
+          return;
+        }
 
         // Current Termius stores SSH-config/identity links as separate records.
         if (obj.__termius_current_record && obj.ssh_config && obj.identity && !obj.address) {
@@ -1963,6 +2013,19 @@ function parseDecryptedData(results) {
         }
       });
     } catch {}
+  });
+
+  const matchesReference = (record, ref) => {
+    if (!ref || typeof ref !== 'object') return false;
+    if (ref.id !== undefined && record.id !== undefined) return valueToString(ref.id) === valueToString(record.id);
+    return ref.local_id !== undefined && record.local_id !== undefined && valueToString(ref.local_id) === valueToString(record.local_id);
+  };
+  hostDefinitions.forEach(host => {
+    if (!host.__termius_current_record) return;
+    const labels = tagHosts.filter(link => matchesReference(host, link.host))
+      .flatMap(link => tags.filter(tag => matchesReference(tag, link.tag)))
+      .map(tag => firstString(tag, LABEL_FIELDS)).filter(Boolean);
+    host.tags = [...new Set(labels)];
   });
 
   const data = { identities, identitiesByUser, identitiesById, identitiesByLabel, keysByLabel, groupsById, connections, sshConfigs, hostDefinitions, snippets, knownHostKeys };
@@ -2810,6 +2873,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  decodeIndexedDbKey,
   deserializeIndexedDbValue,
   normalizeCurrentRecord,
   getDatabasePath,
