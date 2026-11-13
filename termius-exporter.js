@@ -15,9 +15,28 @@ const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 const snappy = require('snappyjs');
+const v8 = require('v8');
 
 const BOM = '\ufeff';
-const DB_PATH = path.join(process.env.APPDATA, 'Termius/IndexedDB/file__0.indexeddb.leveldb/');
+function getDatabasePath(platform = process.platform, env = process.env, home = os.homedir()) {
+  let appData;
+  switch (platform) {
+    case 'win32':
+      appData = env.APPDATA || path.join(home, 'AppData', 'Roaming');
+      break;
+    case 'darwin':
+      appData = path.join(home, 'Library', 'Application Support');
+      break;
+    case 'linux':
+      appData = env.XDG_CONFIG_HOME || path.join(home, '.config');
+      break;
+    default:
+      throw new Error(`不支持的操作系统: ${platform}`);
+  }
+  return path.join(appData, 'Termius', 'IndexedDB', 'file__0.indexeddb.leveldb');
+}
+
+const DB_PATH = getDatabasePath();
 const OUTPUT_DIR = __dirname;
 const OUTPUT_FILES = Object.freeze({
   hostsCsv: 'termius_import.csv',
@@ -1486,6 +1505,7 @@ function levelDbRecordLatestValue(records, userKey, sequence, valueType, value, 
   if (existing && existing.sequence > sequence) return;
 
   records.set(key, {
+    userKey,
     sequence,
     valueType,
     value: valueType === 1 ? value : null,
@@ -1719,6 +1739,7 @@ function extractCurrentLevelDbValues(sourceDir) {
     return [...records.values()]
       .filter(record => record.valueType === 1 && record.value && record.value.length)
       .map(record => ({
+        userKey: record.userKey,
         value: record.value,
         file: record.file,
         sequence: record.sequence
@@ -1728,14 +1749,105 @@ function extractCurrentLevelDbValues(sourceDir) {
   }
 }
 
+function deserializeIndexedDbValue(buffer) {
+  // Chromium prefixes V8 data with an IndexedDB version and a Blink envelope.
+  // Probe only the header; encrypted strings elsewhere are not record boundaries.
+  for (let offset = 0; offset < Math.min(buffer.length - 1, 16); offset++) {
+    if (buffer[offset] !== 0xff) continue;
+    try {
+      return v8.deserialize(buffer.subarray(offset));
+    } catch {}
+  }
+  return null;
+}
+
+function decodeIndexedDbKey(key) {
+  if (!key || key.length < 4) return null;
+  const lengths = [(key[0] >> 5) + 1, ((key[0] >> 2) & 7) + 1, (key[0] & 3) + 1];
+  let offset = 1;
+  const ids = [];
+  for (const length of lengths) {
+    if (offset + length > key.length) return null;
+    let value = 0n;
+    for (let index = 0; index < length; index++) value |= BigInt(key[offset + index]) << BigInt(index * 8);
+    ids.push(value.toString());
+    offset += length;
+  }
+  const primaryKey = key[offset] === 3 && key.length === offset + 9 ? key.readDoubleLE(offset + 1) : undefined;
+  return { databaseId: ids[0], storeId: ids[1], indexId: ids[2], offset, primaryKey };
+}
+
+function normalizeCurrentRecord(record) {
+  let content = {};
+  const payload = record.content || record.command;
+  if (typeof payload === 'string') {
+    try {
+      const parsed = JSON.parse(payload);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) content = parsed;
+    } catch {}
+  }
+  const current = { ...content, ...record, __termius_current_record: true };
+  delete current.content;
+  delete current.command;
+  return current;
+}
+
 async function extractAndDecrypt(key) {
   let encryptedCount = 0;
   let decryptedCount = 0;
   const decryptCache = new Map();
   const results = [];
+  const structuredResults = [];
+  const records = extractCurrentLevelDbValues(DB_PATH);
+  const stores = new Map();
+  for (const record of records) {
+    const prefix = decodeIndexedDbKey(record.userKey);
+    if (!prefix || prefix.storeId !== '0' || prefix.indexId !== '0') continue;
+    const metadata = record.userKey.subarray(prefix.offset);
+    if (metadata[0] !== 50) continue;
+    const store = levelDbReadVarint(metadata, 1);
+    if (!store || store.next !== metadata.length - 1 || metadata[store.next] !== 0) continue;
+    if (record.value.length % 2) continue;
+    const name = Buffer.from(record.value).swap16().toString('utf16le');
+    stores.set(`${prefix.databaseId}:${store.value}`, name);
+  }
 
-  extractCurrentLevelDbValues(DB_PATH).forEach(record => {
+  for (const record of records) {
     const buffer = record.value;
+    const structured = deserializeIndexedDbValue(buffer);
+    if (structured && typeof structured === 'object' && !Array.isArray(structured)) {
+      const decode = async (value, field = '') => {
+        if (typeof value === 'string' && /^BA[A-Za-z0-9+/=]{30,}$/.test(value)) {
+          encryptedCount++;
+          if (!decryptCache.has(value)) decryptCache.set(value, await decrypt(value, key));
+          const plaintext = decryptCache.get(value);
+          if (plaintext === null) throw new Error(`数据库字段解密失败 (${field})，已停止导出以避免写入不完整数据`);
+          decryptedCount++;
+          return plaintext;
+        }
+        if (Array.isArray(value)) return Promise.all(value.map(item => decode(item, field)));
+        if (value && typeof value === 'object') {
+          const decoded = {};
+          for (const [name, item] of Object.entries(value)) decoded[name] = await decode(item, name);
+          return decoded;
+        }
+        return value;
+      };
+      const decoded = await decode(structured);
+      const prefix = decodeIndexedDbKey(record.userKey);
+      if (prefix) {
+        decoded.__termius_collection = stores.get(`${prefix.databaseId}:${prefix.storeId}`) || '';
+        if (decoded.local_id === undefined && Number.isSafeInteger(prefix.primaryKey)) decoded.local_id = prefix.primaryKey;
+      }
+      structuredResults.push({
+        text: JSON.stringify(normalizeCurrentRecord(decoded)),
+        file: record.file,
+        sequence: record.sequence,
+        current: true,
+        meta: {}
+      });
+      continue;
+    }
     const text = buffer.toString('latin1');
     let match;
 
@@ -1760,7 +1872,7 @@ async function extractAndDecrypt(key) {
         meta: buildEncryptedBlockMeta(buffer, match.index, match.index + encrypted.length)
       });
     }
-  });
+  }
 
   for (const result of results) {
     let decrypted = decryptCache.get(result.text);
@@ -1774,7 +1886,7 @@ async function extractAndDecrypt(key) {
     if (decrypted) decryptedCount++;
   }
 
-  const decryptedResults = results.filter(result => result.text);
+  const decryptedResults = [...structuredResults, ...results.filter(result => result.text)];
   Object.defineProperty(decryptedResults, 'stats', {
     enumerable: false,
     value: {
@@ -1801,6 +1913,8 @@ function parseDecryptedData(results) {
   const snippets = new Map();
   const knownHostKeys = new Map();
   const fieldParts = [];
+  const tags = [];
+  const tagHosts = [];
 
   results.forEach((result, index) => {
     const raw = resultText(result).trim();
@@ -1831,7 +1945,31 @@ function parseDecryptedData(results) {
 
       objects.forEach(obj => {
         if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return;
+        if (/DELETE|REMOVED/i.test(valueToString(obj.status)) || obj.deleted === true) return;
         applyMetadataIds(obj, meta);
+
+        if (obj.__termius_collection === 'tags') {
+          tags.push(obj);
+          return;
+        }
+        if (obj.__termius_collection === 'tag_hosts') {
+          tagHosts.push(obj);
+          return;
+        }
+        if (obj.__termius_collection === 'groups') {
+          collectRecordIds(obj).forEach(id => groupsById.set(id, obj));
+          return;
+        }
+
+        // Current Termius stores SSH-config/identity links as separate records.
+        if (obj.__termius_current_record && obj.ssh_config && obj.identity && !obj.address) {
+          sshConfigs.push({
+            ...obj.ssh_config,
+            identity: obj.identity,
+            __termius_current_record: true
+          });
+          return;
+        }
 
         // 身份认证 (带密码)
         if (isIdentityRecord(obj)) {
@@ -1877,6 +2015,19 @@ function parseDecryptedData(results) {
     } catch {}
   });
 
+  const matchesReference = (record, ref) => {
+    if (!ref || typeof ref !== 'object') return false;
+    if (ref.id !== undefined && record.id !== undefined) return valueToString(ref.id) === valueToString(record.id);
+    return ref.local_id !== undefined && record.local_id !== undefined && valueToString(ref.local_id) === valueToString(record.local_id);
+  };
+  hostDefinitions.forEach(host => {
+    if (!host.__termius_current_record) return;
+    const labels = tagHosts.filter(link => matchesReference(host, link.host))
+      .flatMap(link => tags.filter(tag => matchesReference(tag, link.tag)))
+      .map(tag => firstString(tag, LABEL_FIELDS)).filter(Boolean);
+    host.tags = [...new Set(labels)];
+  });
+
   const data = { identities, identitiesByUser, identitiesById, identitiesByLabel, keysByLabel, groupsById, connections, sshConfigs, hostDefinitions, snippets, knownHostKeys };
   attachPasswordFragmentsById(data, fieldParts);
   attachFieldLevelIdentities(data, fieldParts);
@@ -1916,6 +2067,12 @@ function buildSshConfigIndex(data) {
 }
 
 function referencedSshConfigIds(hostDefinition) {
+  if (hostDefinition.__termius_current_record) {
+    return {
+      ids: toStringList([hostDefinition.ssh_config?.id]),
+      localIds: toStringList([hostDefinition.ssh_config?.local_id])
+    };
+  }
   const ownIds = new Set(recordPrimaryIds(hostDefinition));
   const ownLocalIds = new Set(recordPrimaryLocalIds(hostDefinition));
   const refs = Array.isArray(hostDefinition.__termius_ssh_config_object_refs)
@@ -1982,6 +2139,22 @@ function exactIdentityIdsFromSshConfig(data, config) {
 
 function identitiesForHostDefinition(data, hostDefinition) {
   const configs = sshConfigsForHostDefinition(data, hostDefinition);
+  if (hostDefinition.__termius_current_record) {
+    const identities = uniqueObjects(configs.flatMap(config => {
+      const ref = config.identity;
+      if (!ref || typeof ref !== 'object') return [];
+      const current = data.identities.filter(identity => identity.__termius_current_record);
+      const byId = ref.id === undefined ? [] : current.filter(identity => valueToString(identity.id) === valueToString(ref.id));
+      if (byId.length) return byId;
+      return ref.local_id === undefined ? [] : current.filter(identity => valueToString(identity.local_id) === valueToString(ref.local_id));
+    }));
+    return {
+      configs,
+      configIds: [...new Set(configs.flatMap(recordPrimaryIds))],
+      identityIds: [...new Set(identities.flatMap(collectRecordIds))],
+      identities
+    };
+  }
   const identityIds = [
     ...new Set(configs.flatMap(config => exactIdentityIdsFromSshConfig(data, config)))
   ];
@@ -2656,9 +2829,13 @@ async function main() {
   // 初始化
   await sodium.ready;
 
+  if (!fs.existsSync(DB_PATH)) {
+    throw new Error(`未找到 Termius 数据库: ${DB_PATH}，请确保已安装并登录 Termius`);
+  }
+
   // 获取密钥
   logStep(1, 4, '准备解密密钥');
-  logNote('正在读取 Windows 凭据管理器中的 Termius localKey...');
+  logNote('正在读取系统凭据存储中的 Termius localKey...');
   const key = await getEncryptionKey();
   logNote('密钥读取成功。\n');
 
@@ -2696,6 +2873,10 @@ if (require.main === module) {
 }
 
 module.exports = {
+  decodeIndexedDbKey,
+  deserializeIndexedDbValue,
+  normalizeCurrentRecord,
+  getDatabasePath,
   parseDecryptedData,
   buildHostConfig,
   exportHostsCsv,
